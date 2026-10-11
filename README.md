@@ -44,3 +44,4 @@ node cli.mjs --cwd /projeto --task TASK-001 --approve
 JSON/JSONL sob `PI_SUITE_HOME/projects/<hash>`; **sem banco de dados**. Checkers são código confiável executado com permissões do usuário: cwd/allowlist não são um sandbox do SO. Revise scripts antes de autorizar. HMAC detecta adulteração casual; não protege contra outro processo com acesso à chave/mesmas permissões. Não grava saída integral de testes ou segredos.
 
 Instalar/remover: `pi install ./pi-acceptance-gate` /` pi remove ./pi-acceptance-gate`. Não altera settings/modelos/MCP existentes.
+# pi-acceptance-gate
