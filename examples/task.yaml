@@ -1,0 +1,29 @@
+task:
+  id: TASK-001
+  title: Endpoint com idempotência
+  risk: high
+  acceptance:
+    - id: tests
+      type: test
+      command: [node, --test]
+      expectedExitCode: 0
+      timeoutSeconds: 120
+      required: true
+    - id: paths
+      type: git_diff
+      allowedPaths: [src/**, test/**, package.json, package-lock.json, .pi/tasks/**]
+      forbiddenPaths: [.env, secrets/**]
+      required: true
+    - id: review
+      type: human_review
+      condition: risk >= high
+      required: true
+  maxAutoRevisions: 2
+  onFailure: report-and-request-correction
+# Other supported checker shapes:
+# type: coverage; command: [npm, run, coverage]; reportPath: coverage/coverage-summary.json
+# thresholds: {lines: 80, branches: 70}
+# type: vulnerability; command: [npm, run, audit-report]; reportPath: reports/audit.json
+# denySeverities: [high, critical]
+# type: api_contract; url: http://127.0.0.1:3000/health; expectedStatus: 200; requiredKeys: [status]
+# type: idempotency; command: [npm, run, test:idempotency] # real integration test, not a claim

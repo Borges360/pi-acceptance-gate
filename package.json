@@ -1,0 +1,31 @@
+{
+  "name": "pi-acceptance-gate",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*"
+  },
+  "dependencies": {
+    "yaml": "2.8.2",
+    "ajv": "8.17.1"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "bin": {
+    "pi-gate": "./cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}
