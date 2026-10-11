@@ -3,6 +3,8 @@ import {
   scopeOf,
   setTask,
   output,
+  usageText,
+  buildCompletions,
   words,
   uid,
   hash,
@@ -268,15 +270,63 @@ export default function gate(pi, Type) {
         };
       },
     });
+  const gateSpec = {
+    name: 'gate',
+    description: 'Evidence-based acceptance for the current task',
+    actions: {
+      status: { hint: '', description: 'state, coverage and whether evidence is stale' },
+      use: {
+        hint: 'TASK-ID',
+        description: 'select the contract this session works on',
+        args: [
+          {
+            provide: async () =>
+              tasks.map((t) => ({
+                value: t.id,
+                label: t.id,
+                description: `${t.risk ?? 'risk?'} · ${(t.acceptance ?? []).length} checker(s)${current?.id === t.id ? ' · selected' : ''}`,
+              })),
+            hint: 'task id',
+          },
+        ],
+      },
+      init: { hint: '', description: 'write a .pi/tasks/TASK-001.yaml starter contract' },
+      check: { hint: '', description: 'run the contract checkers (confirmed)' },
+      report: { hint: '', description: 'receipts for the latest attempt' },
+      approve: {
+        hint: 'JUSTIFICATION',
+        description: 'human acceptance, tied to this exact snapshot',
+        args: [{ hint: 'why you accept this' }],
+        free: true,
+      },
+      fail: {
+        hint: 'REASON',
+        description: 'reject with a reason',
+        args: [{ hint: 'what is wrong' }],
+        free: true,
+      },
+      arm: { hint: '', description: 'allow time-boxed automatic verification of this contract' },
+      help: { hint: '', description: 'show this list' },
+    },
+  };
+  const noTask = () =>
+    tasks.length
+      ? `No task selected. Pick one: /gate use ${tasks.slice(0, 5).map((t) => t.id).join(' | ')}`
+      : 'No contracts found. Create one with /gate init, or write .pi/tasks/<ID>.yaml (see examples/task.yaml).';
   pi.registerCommand('gate', {
-    description: 'Acceptance: init | use ID | status | check | report | approve | fail | arm',
+    description: 'Acceptance — status | use ID | init | check | report | approve | fail | arm | help',
+    getArgumentCompletions: buildCompletions(gateSpec),
     handler: async (args, ctx) => {
       await init(ctx);
       const [action = 'status', ...rest] = words(args);
+      if (action === 'help') return output(ctx, usageText('gate', gateSpec));
       if (busy && !['status', 'report'].includes(action))
         throw Error('Wait for the current verification to finish');
       if (action === 'init') {
-        if (!ctx.isProjectTrusted()) throw Error('Project trust required');
+        if (!ctx.isProjectTrusted())
+          throw Error(
+            'Project trust is required before the gate writes contracts into this repository.',
+          );
         const path = await safePath(rt.root, '.pi/tasks/TASK-001.yaml');
         await mkdir(join(rt.root, '.pi', 'tasks'), { recursive: true });
         await writeFile(
@@ -288,13 +338,28 @@ export default function gate(pi, Type) {
         return;
       }
       if (action === 'use') {
+        if (!rest[0])
+          throw Error(
+            tasks.length
+              ? `use needs a TASK-ID. Contracts: ${tasks.map((t) => t.id).join(', ')}`
+              : ctx.isProjectTrusted()
+                ? 'use needs a TASK-ID, but .pi/tasks/*.yaml is empty here. Create one with /gate init.'
+                : 'No contracts visible because this project is not trusted, so .pi/tasks/ is not read. Trust the project, then run /gate init.',
+          );
         const t = tasks.find((t) => t.id === rest[0]);
-        if (!t) throw Error('Unknown task');
+        if (!t)
+          throw Error(
+            `Unknown task "${rest[0]}". Contracts in .pi/tasks: ${tasks.map((t) => t.id).join(', ') || 'none — run /gate init'}`,
+          );
         setTask(pi, t.id);
         current = t;
         return output(ctx, { taskId: t.id });
       }
-      if (!current) throw Error('No task. /gate init');
+      if (!current) throw Error(noTask());
+      if (action === 'approve' && !rest.join(' ').trim())
+        throw Error(
+          'approve needs a justification — a human reason is the record, not a checkbox. Example: /gate approve tests cover the fix and diff is scoped to src/auth',
+        );
       if (action === 'check') {
         const approvedHash = hash(current);
         if (!(await rt.confirm(ctx, 'Run task checkers?', JSON.stringify(current.acceptance))))
@@ -362,18 +427,45 @@ export default function gate(pi, Type) {
           (s.report.snapshot.workingTreeHash !== snap.workingTreeHash ||
             s.report.snapshot.commitHash !== snap.commitHash ||
             s.report.contractHash !== hash(current));
-        return output(ctx, {
-          task: current.id,
-          status: stale ? 'stale' : s.status,
-          ...(action === 'report'
-            ? {
-                report: s.report,
-                history: (await rt.store.rows('tasks')).filter((r) => r.entityId === entity(ctx)),
-              }
-            : {}),
-        });
+        const receipts = s.report?.receipts ?? [];
+        const next = stale
+          ? 'Evidence is stale (code, contract or commit changed). Run /gate check.'
+          : !receipts.length
+            ? 'Nothing verified yet. Run /gate check.'
+            : s.status === 'accepted'
+              ? 'Accepted for this snapshot.'
+              : receipts.some((r) => r.status === 'fail')
+                ? 'A checker failed. Fix it, then /gate check.'
+                : receipts.some(
+                      (r) => r.status === 'needs-human' || r.status === 'not-run',
+                    )
+                  ? 'Waiting on human or un-run evidence: /gate approve <justification> or /gate check.'
+                  : 'Run /gate report for full receipts.';
+        return output(
+          ctx,
+          [
+            `task ${current.id} · ${stale ? 'stale' : (s.status ?? 'draft')} · ${receipts.length} receipt(s)`,
+            ...receipts.map(
+              (r) =>
+                `  ${r.status ?? '?'}  ${r.id ?? r.criterionId ?? '?'}${r.required === false ? ' (optional)' : ''}`,
+            ),
+            ...(action === 'report'
+              ? [
+                  `history: ${
+                    (
+                      await rt.store
+                        .rows('tasks')
+                        .filter((r) => r.entityId === entity(ctx))
+                    ).length
+                  } attempt(s) recorded`,
+                  JSON.stringify(s.report ?? null),
+                ]
+              : []),
+            next,
+          ].join('\n'),
+        );
       }
-      throw Error('Unknown /gate command');
+      throw Error(`Unknown /gate ${action}\n${usageText('gate', gateSpec)}`);
     },
   });
 }
