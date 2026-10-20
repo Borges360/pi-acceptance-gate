@@ -121,6 +121,34 @@ export function validate(document) {
     task.maxAutoRevisions > 10
   )
     throw Error('Invalid task contract');
+  if (raw.definitionOfDone != null) {
+    const d = raw.definitionOfDone;
+    const text = (v, max) => typeof v === 'string' && v.trim().length > 0 && v.length <= max;
+    if (
+      !d ||
+      d.schemaVersion !== 1 ||
+      !text(d.objective, 4000) ||
+      !text(d.template, 100) ||
+      !text(d.assistant, 300) ||
+      !Array.isArray(d.answers) ||
+      !d.answers.length ||
+      d.answers.length > 6 ||
+      d.answers.some((a) => !text(a?.question, 300) || !text(a?.answer, 4000)) ||
+      !Array.isArray(d.plan) ||
+      !d.plan.length ||
+      d.plan.length > 12 ||
+      d.plan.some((s) => !text(s, 4000))
+    )
+      throw Error('Invalid definition of done');
+    task.definitionOfDone = {
+      schemaVersion: 1,
+      objective: d.objective,
+      template: d.template,
+      assistant: d.assistant,
+      answers: d.answers.map((a) => ({ question: a.question, answer: a.answer })),
+      plan: [...d.plan],
+    };
+  }
   return task;
 }
 export async function loadTasks(root) {

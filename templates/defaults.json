@@ -1,0 +1,50 @@
+[
+  {
+    "id": "bugfix",
+    "label": "Correção de bug",
+    "description": "Reprodução, resultado esperado e proteção contra regressão.",
+    "keywords": "bug erro falha corrigir correção regression fix crash",
+    "questions": [
+      {"id": "reproduce", "question": "Como reproduzir o problema?", "suggestion": "Informe os passos, os dados de entrada e o resultado atual."},
+      {"id": "expected", "question": "Qual resultado comprova a correção?", "suggestion": "Descreva o comportamento observável esperado e um caso limite."},
+      {"id": "scope", "question": "O que precisa continuar funcionando?", "suggestion": "Liste os fluxos vizinhos e o que está fora do escopo."}
+    ],
+    "steps": ["Reproduzir a falha", "Implementar a menor correção aderente ao projeto", "Validar a correção e os fluxos vizinhos"]
+  },
+  {
+    "id": "feature",
+    "label": "Nova funcionalidade",
+    "description": "Objetivo do usuário, limites e critérios observáveis.",
+    "keywords": "feature implementar criar funcionalidade adicionar tela serviço",
+    "questions": [
+      {"id": "outcome", "question": "Quem vai usar e qual resultado precisa obter?", "suggestion": "Use: dado um contexto, quando o usuário age, então o resultado aparece."},
+      {"id": "boundaries", "question": "Quais casos limite e falhas precisam ser tratados?", "suggestion": "Considere entradas inválidas, cancelamento e indisponibilidade."},
+      {"id": "scope", "question": "O que está fora do escopo?", "suggestion": "Declare integrações opcionais e comportamentos existentes a preservar."}
+    ],
+    "steps": ["Definir o comportamento e os limites", "Implementar a funcionalidade", "Validar os critérios e revisar o resultado"]
+  },
+  {
+    "id": "documentation",
+    "label": "Documentação",
+    "description": "Público, conteúdo verificável e exemplo de uso.",
+    "keywords": "documentação documentacao docs readme manual guia tutorial",
+    "questions": [
+      {"id": "audience", "question": "Quem vai ler e o que precisa conseguir fazer?", "suggestion": "Defina o público e o conhecimento prévio necessário."},
+      {"id": "evidence", "question": "Como confirmar que o conteúdo está correto?", "suggestion": "Inclua exemplos executáveis e fontes do próprio projeto."},
+      {"id": "scope", "question": "Quais arquivos e assuntos entram?", "suggestion": "Liste os documentos e os assuntos excluídos."}
+    ],
+    "steps": ["Conferir o comportamento nas fontes", "Escrever exemplos para o público definido", "Validar exemplos e revisar o conteúdo"]
+  },
+  {
+    "id": "custom",
+    "label": "Do zero",
+    "description": "Definição livre de resultado, evidência e limites.",
+    "keywords": "",
+    "questions": [
+      {"id": "outcome", "question": "O que precisa ser verdade para considerar pronto?", "suggestion": "Descreva um resultado que outra pessoa consiga observar."},
+      {"id": "evidence", "question": "Que evidência comprova esse resultado?", "suggestion": "Indique teste, artefato ou revisão humana específica."},
+      {"id": "scope", "question": "Quais limites e restrições devem ser respeitados?", "suggestion": "Declare arquivos, compatibilidade e ações que exigem autorização."}
+    ],
+    "steps": ["Confirmar resultado, evidência e limites", "Executar a tarefa dentro do escopo", "Verificar evidências e solicitar revisão"]
+  }
+]

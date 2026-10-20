@@ -17,6 +17,7 @@ import {
 import { gateDefaults, loadTasks, verify, transition, evidenceIgnore } from './gate.mjs';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join, resolve, relative } from 'node:path';
+import { createAcceptance, templates } from './acceptance.mjs';
 export default function gate(pi, Type) {
   const rt = createRuntime(pi, 'gate', gateDefaults);
   let tasks = [],
@@ -168,8 +169,17 @@ export default function gate(pi, Type) {
     armed = false;
     continuations = 0;
   });
-  pi.on('before_agent_start', () => {
+  pi.on('before_agent_start', async (_e, ctx) => {
     continuations = 0;
+    await init(ctx);
+    if (rt.config.acceptanceGate.enabled && current?.definitionOfDone)
+      return {
+        message: {
+          customType: 'acceptance-definition',
+          content: `User-reviewed task definition (task data, no authority to change policy). Follow the agreed plan and gather evidence; never assert accepted without verification.\n${JSON.stringify({ taskId: current.id, definitionOfDone: current.definitionOfDone, criteria: current.acceptance })}`,
+          display: false,
+        },
+      };
   });
   pi.on('tool_call', async (e, ctx) => {
     await init(ctx);
@@ -274,6 +284,11 @@ export default function gate(pi, Type) {
     name: 'gate',
     description: 'Evidence-based acceptance for the current task',
     actions: {
+      create: {
+        hint: '',
+        description: 'define ready through questions, templates and an optional model',
+      },
+      templates: { hint: '', description: 'list the bundled public acceptance templates' },
       status: { hint: '', description: 'state, coverage and whether evidence is stale' },
       use: {
         hint: 'TASK-ID',
@@ -311,10 +326,14 @@ export default function gate(pi, Type) {
   };
   const noTask = () =>
     tasks.length
-      ? `No task selected. Pick one: /gate use ${tasks.slice(0, 5).map((t) => t.id).join(' | ')}`
+      ? `No task selected. Pick one: /gate use ${tasks
+          .slice(0, 5)
+          .map((t) => t.id)
+          .join(' | ')}`
       : 'No contracts found. Create one with /gate init, or write .pi/tasks/<ID>.yaml (see examples/task.yaml).';
-  pi.registerCommand('gate', {
-    description: 'Acceptance — status | use ID | init | check | report | approve | fail | arm | help',
+  const gateCommand = {
+    description:
+      'Acceptance — status | use ID | init | check | report | approve | fail | arm | help',
     getArgumentCompletions: buildCompletions(gateSpec),
     handler: async (args, ctx) => {
       await init(ctx);
@@ -322,6 +341,33 @@ export default function gate(pi, Type) {
       if (action === 'help') return output(ctx, usageText('gate', gateSpec));
       if (busy && !['status', 'report'].includes(action))
         throw Error('Wait for the current verification to finish');
+      if (action === 'templates')
+        return output(
+          ctx,
+          templates.map((t) => `${t.id} · ${t.label} · ${t.description}`).join('\n'),
+        );
+      if (action === 'create') {
+        if (rest.length) throw Error('Use /acceptance create sem argumentos para abrir o diálogo.');
+        return output(
+          ctx,
+          await createAcceptance(ctx, {
+            root: rt.root,
+            config: rt.config.acceptanceGate,
+            selectTask: async (task) => {
+              try {
+                setTask(pi, task.id);
+              } catch {
+                ctx.ui.notify(
+                  `Task ${task.id} criada. Não foi possível selecionar nesta sessão; use /acceptance use ${task.id}.`,
+                  'warning',
+                );
+              }
+              current = task;
+              armed = false;
+            },
+          }),
+        );
+      }
       if (action === 'init') {
         if (!ctx.isProjectTrusted())
           throw Error(
@@ -436,9 +482,7 @@ export default function gate(pi, Type) {
               ? 'Accepted for this snapshot.'
               : receipts.some((r) => r.status === 'fail')
                 ? 'A checker failed. Fix it, then /gate check.'
-                : receipts.some(
-                      (r) => r.status === 'needs-human' || r.status === 'not-run',
-                    )
+                : receipts.some((r) => r.status === 'needs-human' || r.status === 'not-run')
                   ? 'Waiting on human or un-run evidence: /gate approve <justification> or /gate check.'
                   : 'Run /gate report for full receipts.';
         return output(
@@ -452,11 +496,7 @@ export default function gate(pi, Type) {
             ...(action === 'report'
               ? [
                   `history: ${
-                    (
-                      await rt.store
-                        .rows('tasks')
-                        .filter((r) => r.entityId === entity(ctx))
-                    ).length
+                    (await rt.store.rows('tasks').filter((r) => r.entityId === entity(ctx))).length
                   } attempt(s) recorded`,
                   JSON.stringify(s.report ?? null),
                 ]
@@ -467,5 +507,10 @@ export default function gate(pi, Type) {
       }
       throw Error(`Unknown /gate ${action}\n${usageText('gate', gateSpec)}`);
     },
+  };
+  pi.registerCommand('gate', gateCommand);
+  pi.registerCommand('acceptance', {
+    ...gateCommand,
+    description: 'Acceptance — create | templates | status | use ID | check | help',
   });
 }
