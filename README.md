@@ -7,6 +7,45 @@ npm ci --ignore-scripts --legacy-peer-deps
 pi -e ./index.ts
 ```
 
+## Definir pronto com `/acceptance create`
+
+`/acceptance create` abre um diálogo para descrever o objetivo, escolher assistência,
+revisar o template e o risco, responder perguntas com sugestões e editar o plano.
+O resumo final mostra o YAML exato antes de criar e selecionar uma nova task em
+`.pi/tasks/TASK-<uuid>.yaml`. Escape em qualquer etapa ou recusar o resumo cancela
+sem criar contrato. Contratos existentes são preservados. Requer projeto confiável,
+TUI/RPC e `acceptanceGate.enabled: true`; não inicia entrevistas automaticamente.
+
+Os [templates públicos](templates/defaults.json) incluem correção de bug,
+funcionalidade, documentação e início do zero. `/acceptance templates` lista as
+opções. `/acceptance` também aceita os comandos de `/gate`, que continua compatível.
+
+As regras locais funcionam sem modelo nem credenciais. Opcionalmente, escolha:
+
+- **Decisões automáticas**: o classificador registrado no Pi (preferindo JEV)
+  escolhe template e risco entre opções conhecidas. As recomendações aparecem
+  primeiro e podem ser trocadas pelo usuário.
+- **Perguntas personalizadas**: o modelo de chat atual do Pi sugere template,
+  risco, perguntas, exemplos de resposta e passos específicos para o objetivo.
+
+Essas opções usam a API nativa do `modelRegistry` quando disponível, sem serviço
+ou extensão obrigatória adicional. Cada chamada envia somente o objetivo sanitizado,
+tem limite de 15 segundos e aceita cancelamento. Respostas inválidas ou falhas
+recaem explicitamente nas regras locais. O fluxo local funciona no host 1.1;
+os recursos de modelos dependem das APIs `classify` / `complete` do host.
+
+A task guarda `definitionOfDone` com objetivo, respostas, template, origem da
+recomendação e plano. Esse contexto é apresentado ao agente quando a task está
+selecionada e o gate está habilitado. Contratos antigos continuam válidos.
+Perguntas viram critérios de revisão humana; um comando de teste pode ser informado
+explicitamente, mas criar a task não executa checkers, não concede `arm` e não
+aprova critérios. `/acceptance status` mostra a pendência; `/gate check` e
+`/gate approve <justificativa>` mantêm suas autorizações e evidências habituais.
+
+Validação sem credenciais: `npm test`. Para carregar o entry point pelo loader do
+Pi instalado e percorrer a criação até o YAML: `node scripts/smoke-create.mjs`.
+Se o host não estiver no resolvedor local, passe `--host-package <diretório-do-pacote>`.
+
 ## Contratos e comandos
 
 `.pi/tasks/*.yaml` suporta` task` ou` tasks` (multitarefa). Compatibilidade com `.pi/acceptance.json`. Veja` examples/task.yaml`.
