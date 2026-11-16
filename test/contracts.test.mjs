@@ -46,7 +46,11 @@ test('real failing process cannot accept; full receipts, timeout inconclusive, c
     assert.equal(r.receipts[1].status, 'skipped-with-reason');
     assert.ok(r.receipts[0].commandHash);
     assert.ok(r.receipts[0].workingTreeHash);
-    assert.equal(r.receipts[0].verifierVersion, '0.2.0');
+    // Intentional change in 0.3.0: `verifierVersion` is the version of the verifier that
+    // produced the receipt, so it moves with the package (gate.mjs `VERIFIER_VERSION`).
+    // A receipt stamped 0.2.0 was produced by the verifier that could not tell
+    // "mvn missing" from "mvn failed"; the digest of the evidence should say so.
+    assert.equal(r.receipts[0].verifierVersion, '0.3.0');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -1,0 +1,6 @@
+schema: harness/skill-metadata/v1
+id: pi-acceptance-gate
+version: 1.0.0
+owner: pi-acceptance-gate
+source: "AGENTS.md, package.json, extension.mjs, gate.mjs, menu.mjs, acceptance.mjs, docs/VALIDACAO.md"
+scope: "product-local; Codex, Pi and Cursor"

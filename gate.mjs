@@ -14,13 +14,53 @@ import {
   yamlFile,
   redact,
 } from './lib/core.mjs';
+import { capabilityReason } from './select.mjs';
 export { snapshot } from './lib/core.mjs';
+
+/** Receipts carry the verifier version: bump it with the package, 0.2.0 → 0.3.0. */
+export const VERIFIER_VERSION = '0.3.0';
+
+/**
+ * Is the executable of a criterion even installed? `where`/`which` answers once per
+ * process; if the finder itself is missing we cannot prove absence, so the criterion
+ * stays in scope and the real run says what it has to say.
+ */
+const probeCache = new Map();
+export async function executableAvailable(exe, root) {
+  const key = `${process.platform}:${exe}`;
+  if (probeCache.has(key)) return probeCache.get(key);
+  const finder = process.platform === 'win32' ? 'where' : 'which';
+  const r = await processRun(finder, [exe], { cwd: root, timeoutMs: 5000 });
+  const available = r.error === 'ENOENT' ? true : r.code === 0 && r.output.trim() !== '';
+  probeCache.set(key, available);
+  return available;
+}
+export const probeCacheClear = () => probeCache.clear();
+/** The gate scope in force for a config fragment. */
+export const scopeSource = (config) => config?.scope?.source ?? 'available';
+
 export const gateDefaults = {
   acceptanceGate: {
     enabled: true,
     autoVerifyOnCandidate: false,
     maxAutoRevisions: 2,
     continueForPendingChecks: false,
+    /**
+     * With more than one contract in `.pi/tasks/`, which one this session works on used
+     * to be decided by the alphabetical order of the files (`tasks[0]`). `autoSelect`
+     * keeps the convenience for the unambiguous cases (one contract, or one contract
+     * that clearly matches the diff) and asks when it is not unambiguous; turning it
+     * off makes every session ask, never guess.
+     */
+    autoSelect: true,
+    /** How long an `arm` authorization lasts: once | ttl | always. */
+    armScope: 'ttl',
+    /**
+     * The gate's scope is what this session can actually run (`available`). `declared`
+     * insists on every criterion in the contract, which is the pre-0.3 behaviour: the
+     * same reasons, but reported as failures of the run instead of missing capability.
+     */
+    scope: { source: 'available', strict: true },
     allowedExecutables: [
       'node',
       'npm',
@@ -121,6 +161,34 @@ export function validate(document) {
     task.maxAutoRevisions > 10
   )
     throw Error('Invalid task contract');
+  if (raw.definitionOfDone != null) {
+    const d = raw.definitionOfDone;
+    const text = (v, max) => typeof v === 'string' && v.trim().length > 0 && v.length <= max;
+    if (
+      !d ||
+      d.schemaVersion !== 1 ||
+      !text(d.objective, 4000) ||
+      !text(d.template, 100) ||
+      !text(d.assistant, 300) ||
+      !Array.isArray(d.answers) ||
+      !d.answers.length ||
+      d.answers.length > 6 ||
+      d.answers.some((a) => !text(a?.question, 300) || !text(a?.answer, 4000)) ||
+      !Array.isArray(d.plan) ||
+      !d.plan.length ||
+      d.plan.length > 12 ||
+      d.plan.some((s) => !text(s, 4000))
+    )
+      throw Error('Invalid definition of done');
+    task.definitionOfDone = {
+      schemaVersion: 1,
+      objective: d.objective,
+      template: d.template,
+      assistant: d.assistant,
+      answers: d.answers.map((a) => ({ question: a.question, answer: a.answer })),
+      plan: [...d.plan],
+    };
+  }
   return task;
 }
 export async function loadTasks(root) {
@@ -162,12 +230,17 @@ export function commandSpec(command, config) {
   if (!parts.length || parts.some((p) => typeof p !== 'string' || /[\r\n\0;&|`<>]/.test(p)))
     throw Error('Shell interpolation denied');
   const exe = parts[0].replace(/^\.\//, '').replace(/\.cmd$/, '');
-  if (!config.allowedExecutables.includes(exe)) throw Error('Command not allowed');
+  if (!config.allowedExecutables.includes(exe))
+    throw Error(`Command not allowed: ${exe} is not in acceptanceGate.allowedExecutables`);
   if (process.platform === 'win32' && ['npm', 'mvnw', 'gradlew'].includes(exe)) {
     if (parts.some((p) => /["%!^]/.test(p))) throw Error('Unsafe Windows argument');
-    return { exe: 'cmd.exe', args: ['/d', '/s', '/c', parts.map((p) => `"${p}"`).join(' ')] };
+    return {
+      exe: 'cmd.exe',
+      args: ['/d', '/s', '/c', parts.map((p) => `"${p}"`).join(' ')],
+      firstToken: exe,
+    };
   }
-  return { exe: parts[0], args: parts.slice(1) };
+  return { exe: parts[0], args: parts.slice(1), firstToken: exe };
 }
 export function sanitizeCommand(command) {
   const parts = Array.isArray(command) ? [...command] : words(command);
@@ -185,16 +258,50 @@ export function registerChecker(type, fn) {
 }
 async function commandCheck(c, { root, config, signal }) {
   if (!c.command) return { status: 'not-run', error: 'No checker command' };
-  const { exe, args } = commandSpec(c.command, config);
-  const r = await processRun(exe, args, {
+  let spec;
+  try {
+    spec = commandSpec(c.command, config);
+  } catch (error) {
+    // An executable outside `allowedExecutables` is a statement about this session's
+    // scope, not a test that failed. Before 0.3 the same throw landed in the generic
+    // `inconclusive` catch, so "mvn is not allowlisted" and "mvn exited 1" were
+    // indistinguishable in the report.
+    const cap = capabilityReason(error);
+    return { status: 'not-run', error: cap.code, reasonCode: cap.code, outOfScope: true };
+  }
+  if (!(await executableAvailable(spec.firstToken, root))) {
+    const code = `${spec.firstToken}-not-installed`;
+    return {
+      status: 'not-run',
+      error: code,
+      reasonCode: code,
+      outOfScope: scopeSource(config) === 'available',
+    };
+  }
+  const r = await processRun(spec.exe, spec.args, {
     cwd: root,
     timeoutMs: (c.timeoutSeconds ?? 120) * 1000,
     signal,
   });
+  if (r.error) {
+    const code =
+      r.error === 'timeout'
+        ? 'checker-timeout'
+        : r.error === 'ENOENT'
+          ? `${spec.firstToken}-not-installed`
+          : String(r.error);
+    return {
+      status: 'inconclusive',
+      error: code,
+      reasonCode: code,
+      exitCode: r.code,
+      reportDigest: r.digest,
+    };
+  }
   return {
-    status: r.error ? 'inconclusive' : r.code === (c.expectedExitCode ?? 0) ? 'pass' : 'fail',
+    status: r.code === (c.expectedExitCode ?? 0) ? 'pass' : 'fail',
     exitCode: r.code,
-    error: r.error,
+    error: null,
     reportDigest: r.digest,
   };
 }
@@ -296,8 +403,18 @@ registerChecker('api_contract', async (c, { config, signal }) => {
     url.username ||
     url.password ||
     !config.allowedHosts.includes(url.hostname)
-  )
-    return { status: 'not-run', error: 'API host not allowlisted' };
+  ) {
+    // Same story as an uninstalled executable: this is the scope of the session, and
+    // the fix is `acceptanceGate.allowedHosts` (a widening that needs a human), not
+    // "the endpoint is broken".
+    const code = `host-not-allowlisted:${url.hostname}`;
+    return {
+      status: 'not-run',
+      error: code,
+      reasonCode: code,
+      outOfScope: scopeSource(config) === 'available',
+    };
+  }
   const response = await fetch(url, {
     method: 'GET',
     redirect: 'error',
@@ -362,7 +479,7 @@ export async function verify(document, root, confirmed, human = false, options =
       contractHash,
       artifactPaths: [],
       reportDigest: null,
-      verifierVersion: '0.2.0',
+      verifierVersion: VERIFIER_VERSION,
       actor: actor(),
     };
     let result;
@@ -378,7 +495,18 @@ export async function verify(document, root, confirmed, human = false, options =
       try {
         result = await checkers.get(c.type)(c, { root, config, signal: options.signal });
       } catch (e) {
-        result = { status: 'inconclusive', error: redact(e.message) };
+        // A checker that throws is not a checker that failed: name the kind of missing
+        // capability (executable, host, tooling) instead of flattening it into the same
+        // anonymous `inconclusive` as a red exit code.
+        const cap = capabilityReason(e);
+        result = {
+          status: 'inconclusive',
+          error: redact(e.message),
+          reasonCode: cap.code,
+          outOfScope:
+            ['executable', 'host', 'tooling'].includes(cap.kind) &&
+            scopeSource(config) === 'available',
+        };
       }
     const receipt = { ...base, ...result, finishedAt: now() };
     receipts.push(receipt);
@@ -390,15 +518,42 @@ export async function verify(document, root, confirmed, human = false, options =
   const required = receipts.filter(
     (r, i) => task.acceptance[i].required !== false && conditional(task, task.acceptance[i]),
   );
+  const outOfScope = receipts.filter((r) => r.outOfScope === true);
+  /**
+   * `scope.strict: false` is the only way a criterion leaves the verdict, and only when
+   * the scope was chosen as `available`. With the default (`strict: true`) an
+   * out-of-scope required criterion still blocks acceptance exactly as it did before:
+   * the *reason* changes, no existing acceptance does.
+   */
+  const relaxed = scopeSource(config) === 'available' && config.scope?.strict === false;
+  const blocking = relaxed ? required.filter((r) => !r.outOfScope) : required;
   const status =
-    stale || required.some((r) => !['pass', 'needs-human'].includes(r.status))
+    stale || blocking.some((r) => !['pass', 'needs-human'].includes(r.status))
       ? 'rejected'
-      : required.some((r) => r.status === 'needs-human')
+      : blocking.some((r) => r.status === 'needs-human')
         ? 'needs_human_review'
         : 'accepted';
+  const failing = blocking.find((r) => !['pass', 'needs-human'].includes(r.status));
   return {
     status,
-    reason: stale ? 'Relevant snapshot changed during verification' : null,
+    reason:
+      (stale
+        ? 'Relevant snapshot changed during verification'
+        : failing?.reasonCode ?? failing?.error ?? null) ??
+      (outOfScope.length
+        ? `${outOfScope.length} critério(s) fora do escopo desta sessão: ${outOfScope
+            .map((r) => `${r.criterionId} (${r.reasonCode ?? r.error})`)
+            .join(', ')}`
+        : null),
+    outOfScope,
+    scope: {
+      source: scopeSource(config),
+      strict: config.scope?.strict !== false,
+      relaxed,
+    },
+    blockingIds: blocking
+      .filter((r) => !['pass', 'needs-human'].includes(r.status))
+      .map((r) => r.criterionId),
     receipts,
     taskId: task.id,
     contractHash,
