@@ -1,0 +1,735 @@
+import {
+  createRuntime,
+  scopeOf,
+  setTask,
+  output,
+  usageText,
+  buildCompletions,
+  words,
+  uid,
+  hash,
+  now,
+  actor,
+  snapshot,
+  safePath,
+  glob,
+  processRun,
+  merge,
+} from './lib/core.mjs';
+import {
+  gateDefaults,
+  loadTasks,
+  verify,
+  transition,
+  evidenceIgnore,
+  capabilityReason,
+  VERIFIER_VERSION,
+} from './gate.mjs';
+import {
+  FIELDS,
+  applyField,
+  panelItems,
+  panelTitle,
+  checkerLines,
+  reportLines,
+  armRows,
+  runDashboard,
+  provideHost,
+} from './menu.mjs';
+import {
+  pickContract,
+  continuationCap,
+  changedPathsFromStatus,
+  suggestCheckers,
+  draftContract,
+  TTL_CHOICES,
+  RISK_ORDER,
+  CHECKER_COST,
+  byCost,
+  recommendedLabel,
+} from './select.mjs';
+import { writeFile, mkdir } from 'node:fs/promises';
+import { join, resolve, relative } from 'node:path';
+
+/** `/gate allow exe mvn` — the two widening targets, named so help can be exact. */
+const WIDENING = { exe: 'allowedExecutables', host: 'allowedHosts' };
+
+export default function gate(pi, Type, injected = {}) {
+  // The entry point imported the host modules statically and hands them over here;
+  // without this the panel would have to `await import()` them and degrade (see index.ts).
+  provideHost(injected.tui, injected.agent);
+  const rt = createRuntime(pi, 'gate', gateDefaults);
+  let tasks = [],
+    current = null,
+    selection = null,
+    explicitId = null,
+    busy = false,
+    continuations = 0,
+    armed = false,
+    armedContract = null,
+    armedUntil = 0,
+    pendingWidening = null,
+    lastReport = null,
+    askedContract = false,
+    declinedCreate = false,
+    announceNeeded = true,
+    diffCache = { key: null, paths: [] };
+  const conf = () => rt.config.acceptanceGate;
+  const locked = () => rt.config.locked?.acceptanceGate ?? {};
+
+  /** Files this session has touched, for the adherence ranking (cached per leaf). */
+  const changedPaths = async (ctx) => {
+    const key = `${ctx.sessionManager.getLeafId()}:${tasks.map((t) => t.id).join(',')}`;
+    if (diffCache.key === key) return diffCache.paths;
+    let paths = [];
+    try {
+      const r = await processRun(
+        'git',
+        ['status', '--porcelain=v1', '-z', '--no-renames', '--untracked-files=all'],
+        { cwd: rt.root },
+      );
+      if (r.code === 0) paths = changedPathsFromStatus(r.output).slice(0, 500);
+    } catch {
+      /* no git: ranking falls back to risk, and says so in its reasonCodes */
+    }
+    diffCache = { key, paths };
+    return paths;
+  };
+
+  const init = async (ctx) => {
+    await rt.init(ctx);
+    if (busy) return selection;
+    tasks = ctx.isProjectTrusted() ? await loadTasks(rt.root) : [];
+    const previous = current?.id;
+    selection = pickContract({
+      tasks,
+      changed: await changedPaths(ctx),
+      config: conf(),
+      explicitId,
+    });
+    current = selection.contract ?? null;
+    if (current && current.id !== previous) announceNeeded = true;
+    if (!current) announceNeeded = true;
+    if (armed && (!current || hash(current) !== armedContract || Date.now() > armedUntil))
+      armed = false;
+    return selection;
+  };
+
+  /** The one-line announcement: which contract, and why it is the one. */
+  const announce = (ctx) => {
+    if (!announceNeeded || !selection) return;
+    announceNeeded = false;
+    if (!selection.contract) {
+      output(ctx, `gate · contrato: nenhum · ${selection.reason}`, 'info');
+      return;
+    }
+    output(
+      ctx,
+      `gate · contrato: ${selection.contract.id} · ${selection.reason}${selection.mode === 'single' || selection.mode === 'ranked' ? ' · mude com /gate use <ID>' : ''}`,
+      'info',
+    );
+  };
+
+  const entity = (ctx) => `${scopeOf(ctx).sessionId}/${current?.id}`;
+  const save = async (ctx, state) => {
+    await rt.store.append('tasks', {
+      id: uid(),
+      projectId: rt.projectId,
+      entityId: entity(ctx),
+      ...scopeOf(ctx),
+      taskId: current.id,
+      anchorId: ctx.sessionManager.getLeafId(),
+      ...state,
+    });
+    await rt.emit('task.status_changed', {
+      taskId: current.id,
+      status: state.status,
+      attemptId: state.attemptId,
+    });
+  };
+  const latest = async (ctx) => {
+    const rows = await rt.store.rows('tasks'),
+      ids = new Set(ctx.sessionManager.getBranch().map((e) => e.id));
+    return (
+      rows
+        .filter((r) => r.entityId === entity(ctx) && (!r.anchorId || ids.has(r.anchorId)))
+        .at(-1) ?? { status: 'draft', attemptId: null }
+    );
+  };
+  const invalidate = async (ctx) => {
+    const state = await latest(ctx);
+    if (state.status !== 'accepted' || !state.report) return;
+    let currentSnapshot;
+    try {
+      currentSnapshot = await snapshot(rt.root, {
+        ignorePaths: evidenceIgnore(current, conf()),
+      });
+    } catch {
+      currentSnapshot = null;
+    }
+    if (
+      !currentSnapshot ||
+      currentSnapshot.commitHash !== state.report.snapshot.commitHash ||
+      currentSnapshot.workingTreeHash !== state.report.snapshot.workingTreeHash ||
+      hash(current) !== state.report.contractHash
+    ) {
+      const next = { ...transition(state, 'in_progress'), attemptId: uid(), invalidatedAt: now() };
+      setTask(pi, current.id, next.attemptId);
+      await save(ctx, next);
+      await rt.emit('gate.invalidated', {
+        taskId: current.id,
+        reason: 'Snapshot/contract changed or cannot be verified',
+      });
+    }
+  };
+  const approved = async (c, receipt) => {
+    for (const r of await rt.store.rows('approvals')) {
+      if (await rt.store.valid(r.signed)) {
+        const p = r.signed.payload;
+        if (
+          p.taskId === current.id &&
+          p.criterionId === c.id &&
+          p.contractHash === receipt.contractHash &&
+          p.workingTreeHash === receipt.workingTreeHash &&
+          p.commitHash === receipt.commitHash &&
+          p.sessionId === scopeOf(rt.ctx).sessionId &&
+          (p.branchId === 'root' ||
+            rt.ctx.sessionManager.getBranch().some((entry) => entry.id === p.branchId)) &&
+          Date.parse(p.expiresAt) > Date.now()
+        )
+          return true;
+      }
+    }
+    return false;
+  };
+  const check = async (ctx, confirmed, approvedHash = null) => {
+    await init(ctx);
+    if (armed && (hash(current) !== armedContract || Date.now() > armedUntil)) armed = false;
+    if (!current) throw Error(noTask(ctx));
+    if (approvedHash && hash(current) !== approvedHash)
+      throw Error('Contract changed during approval; confirm again');
+    if (!ctx.isProjectTrusted()) throw Error('Project not trusted');
+    if (busy) throw Error('Verification already running');
+    busy = true;
+    try {
+      let state = await latest(ctx);
+      if (state.status === 'needs_human_review' && !confirmed)
+        throw Error('Human decision required');
+      if (
+        state.status === 'draft' ||
+        ['accepted', 'rejected', 'needs_human_review'].includes(state.status)
+      ) {
+        state = transition(state, 'in_progress');
+        state.attemptId = uid();
+        setTask(pi, current.id, state.attemptId);
+        await save(ctx, state);
+      }
+      state = transition(state, 'candidate');
+      await save(ctx, state);
+      state = transition(state, 'verifying');
+      await save(ctx, state);
+      const result = await verify(current, rt.root, confirmed, false, {
+        config: conf(),
+        signal: ctx.signal,
+        isApproved: approved,
+        onReceipt: async (r) =>
+          rt.store.append('gate-receipts', {
+            ...r,
+            ...scopeOf(ctx),
+            taskId: current.id,
+            attemptId: state.attemptId,
+          }),
+      });
+      lastReport = result;
+      state = { ...transition(state, result.status), report: result };
+      await save(ctx, state);
+      // `arm: once` is spent the moment it is used; anything else keeps the window.
+      if (conf().armScope === 'once') armed = false;
+      await rt.emit('gate.evaluated', {
+        taskId: current.id,
+        status: result.status,
+        contractHash: result.contractHash,
+        outOfScope: (result.outOfScope ?? []).map((r) => r.reasonCode ?? r.criterionId),
+        passingCheckIds: result.receipts
+          .filter((r) => r.status === 'pass')
+          .map((r) => r.criterionId),
+        evidenceIds: result.receipts.filter((r) => r.status === 'pass').map((r) => r.id),
+        verified: true,
+      });
+      return result;
+    } finally {
+      busy = false;
+    }
+  };
+
+  /* ---------------------------------------------------------------- *\n   Rescue: the gate scope is what this session can run — help widen it or\n   drop the capability, in the cheapest order, and never silently.\n   ------------------------------------------------------------------ */
+
+  /** Hosts the selected contract's `api_contract` criteria would reach. */
+  const contractHosts = () => {
+    const hosts = new Set();
+    for (const c of current?.acceptance ?? []) {
+      if (c.type !== 'api_contract' || !c.url) continue;
+      try {
+        hosts.add(new URL(c.url).hostname);
+      } catch {
+        /* malformed url: the checker will say so */
+      }
+    }
+    return [...hosts];
+  };
+
+  /** Executables the contract needs but the allowlist blocks, cheapest criterion first. */
+  const blockedExecutables = () => {
+    const rows = [];
+    for (const c of byCost(current?.acceptance ?? [])) {
+      if (!c.command || ['human', 'human_review', 'git_diff', 'file', 'documentation'].includes(c.type))
+        continue;
+      const parts = Array.isArray(c.command) ? c.command : words(c.command);
+      const exe = String(parts[0] ?? '').replace(/^\.\//, '').replace(/\.cmd$/, '');
+      if (!exe) continue;
+      rows.push({
+        exe,
+        criterionId: c.id,
+        cost: CHECKER_COST[c.type] ?? 5,
+        allowed: (conf().allowedExecutables ?? []).includes(exe),
+      });
+    }
+    return rows;
+  };
+
+  /**
+   * A checker the session cannot run is a question, not a verdict: name the cheapest
+   * way to get the evidence, offer to do it, and stop asking after a refusal.
+   * (`capabilityReason` is what makes "mvn is not installed" readable as that, instead
+   * of the same `inconclusive` as a failing test.)
+   */
+  const rescueOutOfScope = async (ctx, report) => {
+    const blocked = (report?.outOfScope ?? []).filter((r) => r.outOfScope);
+    if (!blocked.length) return [];
+    const exeRows = blockedExecutables();
+    const lines = [];
+    for (const r of blocked) {
+      const code = r.reasonCode ?? 'capability-missing';
+      const fix = code.startsWith('host-not-allowlisted')
+        ? `/gate allow host ${code.split(':')[1]}`
+        : code.endsWith('-not-installed')
+          ? `instale ${code.replace('-not-installed', '')} (ou troque o checker) · /gate scope declared para cobrar mesmo assim`
+          : `/gate allow exe ${exeRows.find((x) => x.criterionId === r.criterionId)?.exe ?? '<exe>'}`;
+      lines.push(`${r.criterionId}: ${code} — ${fix}`);
+    }
+    const candidates = byCost(exeRows.filter((x) => !x.allowed));
+    if (!ctx.hasUI || typeof ctx.ui.confirm !== 'function' || declinedCreate === 'no-widen')
+      return lines;
+    if (pendingWidening === null && !candidates.length) return lines;
+    for (const c of candidates.slice(0, 1)) {
+      const agreed = await ctx.ui.confirm(
+        'Checker fora do escopo desta sessão',
+        `${c.criterionId} precisa de \`${c.exe}\`, que não está em acceptanceGate.allowedExecutables. Liberar \`c.exe\` é widening de segurança: escreve no arquivo do projeto e o contrato passa a poder executar esse binário. Liberar?`,
+      );
+      if (!agreed) {
+        declinedCreate = 'no-widen';
+        lines.push(`recusado nesta sessão — nada será perguntado de novo; ${c.criterionId} segue out-of-scope`);
+        return lines;
+      }
+      const written = await widen(ctx, 'exe', c.exe);
+      lines.push(`liberado ${c.exe} → ${written}`);
+    }
+    return lines;
+  };
+
+  /**
+   * Widening writes the security surface of THIS project, never the global config: a
+   * `--global` allowlist would let one repo's contract run binaries in every other one.
+   */
+  const widen = async (ctx, kind, value) => {
+    if (!ctx.isProjectTrusted())
+      throw Error(
+        `Widening precisa de projeto confiado: confie este repo e repita /gate allow ${kind} ${value} (nada foi escrito).`,
+      );
+    const base = conf();
+    const { patch } = applyField(base, WIDENING[kind], `add:${value}`, {
+      locked: locked(),
+      state: { contractHosts: contractHosts() },
+    });
+    return rt.save('acceptanceGate', patch, { global: false });
+  };
+
+  /** Ask which contract this session works on, once, and remember a refusal. */
+  const askContract = async (ctx) => {
+    if (askedContract || !selection?.ask) return selection;
+    askedContract = true;
+    const rows = (selection.ranked?.scored ?? []).slice(0, 6);
+    if (!rows.length || !ctx.hasUI || typeof ctx.ui.select !== 'function') return selection;
+    const labels = rows.map((row, i) =>
+      recommendedLabel(
+        { id: row.taskId },
+        i,
+        `aderência ${row.score} · ${row.checkers} checker(s) · risco ${row.risk}${row.reasonCodes.length ? ` · ${row.reasonCodes.join(' ')}` : ''}`,
+      ),
+    );
+    const chosen = await ctx.ui.select(
+      `${tasks.length} contratos em .pi/tasks/ — em qual esta sessão trabalha?`,
+      labels,
+    );
+    if (!chosen) return selection; // a refusal is respected: no second asking
+    const id = String(chosen).split(' ')[0];
+    const picked = tasks.find((t) => t.id === id);
+    if (picked) {
+      explicitId = picked.id;
+      setTask(pi, picked.id);
+      current = picked;
+      selection = { ...selection, contract: picked, mode: 'explicit', reason: `você escolheu ${picked.id}` };
+      announceNeeded = true;
+    }
+    return selection;
+  };
+
+  /** No contract at all: ask, help create, and keep the choice explicit. */
+  const noTask = (ctx) =>
+    tasks.length
+      ? `Nenhum contrato selecionado entre ${tasks.map((t) => t.id).join(', ')} — escolha: /gate use ${tasks[0].id}`
+      : ctx.hasUI
+        ? 'Nenhum contrato em .pi/tasks/. Abra /gate (sem argumento) para criar um, ou rode /gate init.'
+        : 'Nenhum contrato em .pi/tasks/. Crie um com /gate init (escreve .pi/tasks/TASK-001.yaml) e edite os checkers, ou rode /gate num cliente TUI para criá-lo pelo painel.';
+
+  const createContract = async (ctx, { id, title, risk, checkerIds, persist = true }) => {
+    if (!ctx.isProjectTrusted())
+      throw Error(
+        'O gate só escreve contratos em projeto confiado: confie este repositório e repita /gate init.',
+      );
+    if (!/^[A-Za-z0-9_-]{1,100}$/.test(String(id ?? '')))
+      throw Error(`ID inválido: use /gate init TASK-002 (letras, números, _ ou -)`);
+    const chosen = suggestCheckers({ nodeProject: true }).filter(
+      (c) => !checkerIds || checkerIds.includes(c.id),
+    );
+    const document = {
+      task: {
+        id,
+        title: title || `Acceptance for ${id}`,
+        risk: RISK_ORDER.includes(risk) ? risk : 'moderate',
+        acceptance: chosen.map(({ id: cid, type, command, allowedPaths, forbiddenPaths, required }) => ({
+          id: cid,
+          type,
+          ...(command ? { command } : {}),
+          ...(allowedPaths ? { allowedPaths } : {}),
+          ...(forbiddenPaths ? { forbiddenPaths } : {}),
+          required,
+        })),
+        maxAutoRevisions: 2,
+      },
+    };
+    if (!persist) {
+      // "só desta vez": the contract is used by this session and never written.
+      const task = (await import('./gate.mjs')).validate(document);
+      tasks = [...tasks, task];
+      explicitId = task.id;
+      current = task;
+      selection = {
+        contract: task,
+        mode: 'explicit',
+        ranked: selection?.ranked,
+        reasonCodes: ['session-only-contract'],
+        reason: `contrato ${task.id} criado nesta sessão, sem escrever arquivo`,
+      };
+      announceNeeded = true;
+      return { path: null, task };
+    }
+    const path = await safePath(rt.root, `.pi/tasks/${id}.yaml`);
+    await mkdir(join(rt.root, '.pi', 'tasks'), { recursive: true });
+    await writeFile(path, draftContract(document.task), { mode: 0o600 });
+    diffCache = { key: null, paths: diffCache.paths };
+    const reloaded = await loadTasks(rt.root);
+    tasks = reloaded;
+    explicitId = id;
+    current = reloaded.find((t) => t.id === id) ?? null;
+    selection = {
+      contract: current,
+      mode: 'explicit',
+      ranked: selection?.ranked,
+      reasonCodes: ['contract-created'],
+      reason: `contrato ${id} criado por você`,
+    };
+    announceNeeded = true;
+    return { path, task: current };
+  };
+
+  /**
+   * Bare `/gate` with no contracts: ask and help instead of throwing the error the
+   * user used to see (`Error('No contracts found…')`).
+   */
+  const offerCreate = async (ctx) => {
+    if (!ctx.hasUI || typeof ctx.ui.confirm !== 'function' || declinedCreate) {
+      if (declinedCreate) return output(ctx, 'ok — sem contrato, o gate não verifica nada nesta sessão.');
+      throw Error(noTask(ctx));
+    }
+    const agreed = await ctx.ui.confirm(
+      'Nenhum contrato de aceite neste projeto',
+      '.pi/tasks/ está vazio, então não há o que verificar. Criar um contrato agora com os checkers mais baratos primeiro (git_diff de graça, node --test, review humano)?',
+    );
+    if (!agreed) {
+      declinedCreate = true;
+      return output(ctx, 'ok — nada foi escrito; o gate fica quieto até existir um contrato.');
+    }
+    const id =
+      (typeof ctx.ui.input === 'function'
+        ? await ctx.ui.input('ID do contrato', 'TASK-002')
+        : undefined) || 'TASK-002';
+    const risk =
+      (typeof ctx.ui.select === 'function'
+        ? await ctx.ui.select('Risco do trabalho', ['low', 'moderate', 'high', 'critical'])
+        : undefined) || 'moderate';
+    const keep =
+      typeof ctx.ui.confirm === 'function'
+        ? await ctx.ui.confirm('Persistir?', 'grava .pi/tasks/<ID>.yaml no projeto (revisável em git) — cancelar usa só nesta sessão')
+        : true;
+    const created = await createContract(ctx, { id, risk, persist: keep !== false });
+    return output(
+      ctx,
+      created.path
+        ? `contrato ${id} criado · ${created.task.acceptance.length} checker(s) · salvo em ${created.path}`
+        : `contrato ${id} criado só nesta sessão · ${created.task.acceptance.length} checker(s) · nada foi escrito`,
+    );
+  };
+
+  pi.on('session_start', async (_e, ctx) => {
+    await init(ctx);
+    await askContract(ctx);
+    announce(ctx);
+    armed = false;
+    continuations = 0;
+  });
+  pi.on('before_agent_start', async (_e, ctx) => {
+    continuations = 0;
+    await init(ctx);
+    announce(ctx);
+  });
+  pi.on('tool_call', async (e, ctx) => {
+    await init(ctx);
+    if (!current) return;
+    if (current.forbiddenTools.some((g) => glob(g, e.toolName)))
+      return { block: true, reason: 'Task contract denies this tool' };
+    const paths = [e.input?.path]
+      .filter((p) => typeof p === 'string')
+      .map((p) => relative(rt.root, resolve(ctx.cwd, p)).split(String.fromCharCode(92)).join('/'));
+    const rules = current.acceptance.filter((c) => c.type === 'git_diff');
+    if (
+      ['write', 'edit'].includes(e.toolName) &&
+      paths.some(
+        (p) =>
+          p &&
+          rules.some(
+            (c) =>
+              p === '..' ||
+              p.startsWith('../') ||
+              (c.forbiddenPaths ?? []).some((g) => glob(g, p)) ||
+              (c.allowedPaths && !c.allowedPaths.some((g) => glob(g, p))),
+          ),
+      )
+    )
+      return { block: true, reason: 'Task contract forbids modifying this path' };
+  });
+  pi.on('tool_result', async (_e, ctx) => {
+    await init(ctx);
+    if (current) await invalidate(ctx);
+  });
+  pi.on('agent_before_settle', async (e, ctx) => {
+    await init(ctx);
+    if (current) await invalidate(ctx);
+    if (!current || !conf().enabled || e.outcome !== 'completed') return;
+    if (armed && conf().autoVerifyOnCandidate) {
+      const report = await check(ctx, true);
+      if (report.status === 'accepted') return;
+    }
+    // The clamp is kept — it is what stops the gate from looping — but it is computed
+    // by the same pure function the panel shows, so "pedi 3, obtive 1" is explained.
+    const cap = continuationCap(current.maxAutoRevisions, conf().maxAutoRevisions);
+    if (
+      !conf().continueForPendingChecks ||
+      continuations >= cap.applied ||
+      !e.context?.canContinue
+    )
+      return;
+    const s = await latest(ctx);
+    if (s.status === 'accepted' || s.status === 'needs_human_review') return;
+    continuations++;
+    await rt.emit('gate.revision_requested', {
+      taskId: current.id,
+      revision: continuations,
+      cap: cap.applied,
+      reasonCodes: cap.reasonCodes,
+    });
+    return {
+      continue: true,
+      entries: [
+        ...e.entries,
+        {
+          type: 'custom_message',
+          customType: 'gate-pending',
+          content:
+            'Acceptance is not verified. Use gate_check if authorized; otherwise report pending checks and stop. Do not assert accepted.',
+          display: false,
+        },
+      ],
+    };
+  });
+  pi.on('agent_settled', async (_e, ctx) => {
+    await init(ctx);
+    if (current) {
+      await invalidate(ctx);
+      const s = await latest(ctx);
+      const cap = continuationCap(current.maxAutoRevisions, conf().maxAutoRevisions);
+      ctx.ui.setStatus(
+        'gate',
+        `gate · ${s.status} · ${current.id} · cont ${cap.applied}${cap.requested > cap.applied ? '(teto)' : ''}`,
+      );
+    } else {
+      ctx.ui.setStatus('gate', 'gate · sem contrato');
+    }
+  });
+  pi.on('session_shutdown', async () => {
+    await rt.dispose();
+  });
+  if (Type)
+    pi.registerTool({
+      name: 'gate_check',
+      label: 'Acceptance checks',
+      description:
+        'Run current task checkers with existing user authorization; returns actual evidence.',
+      parameters: Type.Object({}),
+      async execute(_id, _params, _signal, _update, ctx) {
+        await init(ctx);
+        const approvedHash = hash(current);
+        const confirmed =
+          armed ||
+          (await rt.confirm(
+            ctx,
+            'Run acceptance checkers?',
+            JSON.stringify(current?.acceptance ?? []),
+          ));
+        if (!confirmed) throw Error('No user authorization');
+        const report = await check(ctx, true, approvedHash);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(report) }],
+          details: report,
+          isError: report.status !== 'accepted',
+        };
+      },
+    });
+  const gateSpec = {
+    name: 'gate',
+    description: 'Evidence-based acceptance for the current task',
+    actions: {
+      // An empty argument list is the panel, not a subcommand: it has to be in the
+      // completion surface, otherwise users only ever learn the grammar.
+      '(vazio)': { hint: '', description: 'abre o painel: contrato, escopo, checkers, arm' },
+      status: { hint: '', description: 'state, coverage and whether evidence is stale' },
+      use: {
+        hint: 'TASK-ID',
+        description: 'select the contract this session works on',
+        args: [
+          {
+            provide: async () =>
+              tasks.map((t) => ({
+                value: t.id,
+                label: t.id,
+                description: `${t.risk ?? 'risk?'} · ${(t.acceptance ?? []).length} checker(s)${current?.id === t.id ? ' · selected' : ''}`,
+              })),
+            hint: 'task id',
+          },
+        ],
+      },
+      init: {
+        hint: '[TASK-ID]',
+        description: 'write a starter contract into .pi/tasks/<ID>.yaml',
+        args: [{ hint: 'task id' }],
+      },
+      check: { hint: '', description: 'run the contract checkers (confirmed)' },
+      report: { hint: '', description: 'receipts for the latest attempt' },
+      approve: {
+        hint: 'JUSTIFICATION',
+        description: 'human acceptance, tied to this exact snapshot',
+        args: [{ hint: 'why you accept this' }],
+        free: true,
+      },
+      fail: {
+        hint: 'REASON',
+        description: 'reject with a reason',
+        args: [{ hint: 'what is wrong' }],
+        free: true,
+      },
+      arm: {
+        hint: '[once|15min|1h|8h|always]',
+        description: 'authorize automatic verification (ttl persists, once does not)',
+        args: [{ values: TTL_CHOICES.map((t) => ({ value: t.value })), hint: 'alcance' }],
+      },
+      'arm-off': { hint: '', description: 'revoke the automatic-verification authorization' },
+      scope: {
+        hint: 'SCOPE',
+        description: 'available = só o que a sessão executa · declared = tudo do contrato',
+        args: [{ values: FIELDS.scopeSource.values.map((v) => ({ value: v })), hint: 'source' }],
+      },
+      allow: {
+        hint: 'exe|host VALOR',
+        description: 'widening de segurança, com confirmação, no arquivo do projeto',
+        args: [
+          { values: [{ value: 'exe' }, { value: 'host' }], hint: 'kind', advance: true },
+          {
+            provide: async () => [
+              ...blockedExecutables().map((b) => ({
+                value: b.exe,
+                description: `libera ${b.exe} para o checker ${b.criterionId}`,
+              })),
+              ...contractHosts().map((h) => ({ value: h, description: `libera ${h}` })),
+            ],
+            hint: 'valor',
+          },
+        ],
+      },
+      deny: {
+        hint: 'exe|host VALOR',
+        description: 'tirar da allowlist',
+        args: [
+          { values: [{ value: 'exe' }, { value: 'host' }], hint: 'kind', advance: true },
+          {
+            provide: async () => [
+              ...(conf().allowedExecutables ?? []).map((v) => ({ value: v })),
+              ...(conf().allowedHosts ?? []).map((v) => ({ value: v })),
+            ],
+            hint: 'valor',
+          },
+        ],
+      },
+      help: { hint: '', description: 'show this list' },
+    },
+  };
+
+  /* ------------------------------------------------------------------ *\n   Text-command path: same table, same locks, same persistence (rule B).\n   ------------------------------------------------------------------ */
+  const persist = (patch, { global = false } = {}) =>
+    rt.save('acceptanceGate', patch, { global }).then(() => patch);
+
+  const setField = async (id, value, { quiet = false } = {}) => {
+    const { patch, note } = applyField(conf(), id, value, {
+      locked: locked(),
+      state: { contractHosts: contractHosts() },
+    });
+    const written = await persist(patch);
+    if (quiet) return note;
+    // The patch is merged into the live config as it is written, so the change is
+    // already in effect. Sending the user to `/reload` here only teaches them to
+    // distrust a command that just worked.
+    output(ctx => 0, '');
+    return note;
+  };
+
+  const applyAndSay = async (id, value) => {
+    const { patch, note } = applyField(conf(), id, value, {
+      locked: locked(),
+      state: { contractHosts: contractHosts() },
+    });
+    const written = await persist(patch);
+    output(
+      ctx2,
+      `${note}\nsalvo em ${written} · já em efeito (nada precisa ser recarregado)`,
+    );
+    return note;
+  };

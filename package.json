@@ -1,7 +1,19 @@
 {
   "name": "pi-acceptance-gate",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
+  "files": [
+    "index.ts",
+    "extension.mjs",
+    "cli.mjs",
+    "gate.mjs",
+    "acceptance.mjs",
+    "templates/**",
+    "menu.mjs",
+    "select.mjs",
+    "lib/**",
+    "docs/assets/**"
+  ],
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -11,7 +23,8 @@
   ],
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-ai": "*"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "dependencies": {
     "yaml": "2.8.2",
@@ -26,6 +39,8 @@
     "pi-gate": "./cli.mjs"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "smoke": "node scripts/smoke-panel.mjs",
+    "smoke:create": "node scripts/smoke-create.mjs"
   }
 }

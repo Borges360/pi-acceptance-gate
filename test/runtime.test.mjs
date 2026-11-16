@@ -6,6 +6,33 @@ import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import install from '../extension.mjs';
 import { fakePi } from '../test-support/fakes.mjs';
+import { gateEnv } from '../test-support/panel.mjs';
+
+test('Gate preserves the continuation budget while Longrun owns continuity', async (t) => {
+  const env = await gateEnv(t, {
+    config: 'acceptanceGate:\n  enabled: true\n  continueForPendingChecks: true\n',
+  });
+  const boundary = { outcome: 'completed', entries: [], context: { canContinue: true } };
+  let ownership = 'active';
+  const unsubscribe = env.f.pi.events.on('pi.compose.request.v2', (request) => {
+    const respond = (status, sessionId = request.sessionId) => env.f.pi.events.emit('pi.compose.result.v2', {
+      ...request, source: 'pi-longrun', target: request.source, sessionId,
+      payload: { ...request.payload, status },
+    });
+    respond('pending');
+    respond('idle', 'foreign-session');
+    queueMicrotask(() => respond(ownership));
+  });
+  t.after(unsubscribe);
+  assert.equal(await env.f.emit('agent_before_settle', boundary), undefined);
+
+  ownership = 'idle';
+  assert.equal(await env.f.emit('agent_before_settle', { ...boundary, continue: true }), undefined);
+  const standalone = await env.f.emit('agent_before_settle', boundary);
+  assert.equal(standalone.continue, true);
+  assert.deepEqual(standalone.entries.map((entry) => entry.customType), ['gate-pending']);
+  assert.equal(await env.f.emit('agent_before_settle', boundary), undefined);
+});
 test('human approval bound to snapshot and contract, report journal kept, stale evidence detected', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gate-runtime-'));
   const old = process.env.PI_SUITE_HOME;
